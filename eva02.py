@@ -119,34 +119,26 @@ class BloodCellDataset(Dataset):
 
 # ==================== AUGMENTATIONS ====================
 def get_train_transforms():
-    """Strong augmentation for training"""
+    """Optimized augmentation - cân bằng accuracy và tốc độ"""
     return A.Compose([
         A.Resize(Config.IMG_SIZE, Config.IMG_SIZE),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=45, p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.4),
+        # Bỏ các transform nặng: OpticalDistortion, GridDistortion, MotionBlur
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0)),
+            A.GaussNoise(var_limit=(10.0, 30.0)),
             A.GaussianBlur(blur_limit=(3, 5)),
-            A.MotionBlur(blur_limit=5),
-        ], p=0.3),
-        A.OneOf([
-            A.OpticalDistortion(distort_limit=0.2),
-            A.GridDistortion(distort_limit=0.2),
         ], p=0.2),
         A.OneOf([
-            A.CLAHE(clip_limit=4.0),
-            A.Sharpen(),
-        ], p=0.3),
-        A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20),
-        ], p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15),
+            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15),
+        ], p=0.4),
         A.CoarseDropout(
-            max_holes=8, max_height=Config.IMG_SIZE//16, max_width=Config.IMG_SIZE//16,
-            min_holes=1, min_height=Config.IMG_SIZE//32, min_width=Config.IMG_SIZE//32,
-            fill_value=0, p=0.3
+            max_holes=6, max_height=Config.IMG_SIZE//20, max_width=Config.IMG_SIZE//20,
+            min_holes=1, min_height=Config.IMG_SIZE//40, min_width=Config.IMG_SIZE//40,
+            fill_value=0, p=0.2
         ),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
@@ -161,7 +153,7 @@ def get_valid_transforms():
     ])
 
 def get_tta_transforms():
-    """Test Time Augmentation - 5 transforms"""
+    """Test Time Augmentation - 4 transforms (optimized)"""
     return [
         # Original
         A.Compose([
@@ -183,18 +175,10 @@ def get_tta_transforms():
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ]),
-        # Rotate90
+        # Transpose (Rotate90)
         A.Compose([
             A.Resize(Config.IMG_SIZE, Config.IMG_SIZE),
             A.Transpose(p=1.0),
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ToTensorV2()
-        ]),
-        # HFlip + VFlip
-        A.Compose([
-            A.Resize(Config.IMG_SIZE, Config.IMG_SIZE),
-            A.HorizontalFlip(p=1.0),
-            A.VerticalFlip(p=1.0),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ]),
@@ -306,7 +290,7 @@ def get_weighted_sampler(labels):
     return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
 # ==================== TRAINING ====================
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler):
+def train_one_epoch(model, loader, criterion, optimizer, scaler):
     model.train()
     total_loss = 0
     all_preds, all_labels = [], []
@@ -319,7 +303,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler):
         
         optimizer.zero_grad()
         
-        if use_amp:
+        if use_amp and scaler is not None:
             with autocast():
                 outputs = model(images)
                 loss = criterion(outputs, labels)
@@ -335,7 +319,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         
-        scheduler.step()
+        # Không step scheduler ở đây - sẽ step theo epoch
         
         total_loss += loss.item()
         preds = outputs.argmax(dim=1).cpu().numpy()
@@ -383,12 +367,16 @@ def predict_tta(model, test_images):
     tta_transforms = get_tta_transforms()
     all_preds = []
     use_amp = Config.USE_AMP and torch.cuda.is_available()
+    use_pin_memory = torch.cuda.is_available()
+    
+    # TTA dùng batch size lớn hơn vì không cần gradient
+    tta_batch_size = Config.BATCH_SIZE * 3  # 36 thay vì 12
     
     for tta_idx, transform in enumerate(tta_transforms):
         print(f"   TTA {tta_idx + 1}/{len(tta_transforms)}")
         dataset = BloodCellDataset(test_images, transform=transform, is_test=True)
-        loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=False, 
-                           num_workers=Config.NUM_WORKERS, pin_memory=True)
+        loader = DataLoader(dataset, batch_size=tta_batch_size, shuffle=False, 
+                           num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory)
         
         preds = []
         for images in tqdm(loader, leave=False):
@@ -475,15 +463,16 @@ def train():
         train_dataset = BloodCellDataset(X_train, y_train, transform=get_train_transforms())
         val_dataset = BloodCellDataset(X_val, y_val, transform=get_valid_transforms())
         
-        # Loaders
+        # Loaders - pin_memory chỉ khi có CUDA
+        use_pin_memory = torch.cuda.is_available()
         train_loader = DataLoader(
             train_dataset, batch_size=Config.BATCH_SIZE,
             sampler=get_weighted_sampler(y_train),
-            num_workers=Config.NUM_WORKERS, pin_memory=True, drop_last=True
+            num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory, drop_last=True
         )
         val_loader = DataLoader(
             val_dataset, batch_size=Config.BATCH_SIZE * 2,
-            shuffle=False, num_workers=Config.NUM_WORKERS, pin_memory=True
+            shuffle=False, num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory
         )
         
         # Model
@@ -495,15 +484,15 @@ def train():
             model = nn.DataParallel(model)
         
         # Loss - KHÔNG dùng class weights vì đã có weighted sampler
-        # (tránh double weighting làm F1 xấu)
         criterion = FocalLoss(alpha=None, gamma=Config.FOCAL_GAMMA, 
                              label_smoothing=Config.LABEL_SMOOTHING)
         
-        # Optimizer, Scheduler
+        # Optimizer
         optimizer = AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
         
-        num_steps = len(train_loader) * Config.EPOCHS
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=num_steps//3, T_mult=1, eta_min=Config.MIN_LR)
+        # Scheduler - step theo EPOCH (không phải batch)
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=Config.MIN_LR)
         
         # GradScaler chỉ dùng khi có CUDA
         scaler = GradScaler() if torch.cuda.is_available() else None
@@ -518,12 +507,16 @@ def train():
             print(f"\n   Epoch {epoch + 1}/{Config.EPOCHS}")
             
             train_loss, train_f1 = train_one_epoch(
-                model, train_loader, criterion, optimizer, scheduler, scaler
+                model, train_loader, criterion, optimizer, scaler
             )
             val_loss, val_f1, val_probs = validate(model, val_loader, criterion)
             
+            # Step scheduler sau mỗi epoch
+            scheduler.step()
+            
             print(f"   Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
             print(f"   Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
+            print(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
             
             if val_f1 > best_f1:
                 best_f1 = val_f1

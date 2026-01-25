@@ -394,36 +394,26 @@ class BloodCellDataset(Dataset):
 
 # ==================== AUGMENTATIONS ====================
 def get_train_transforms(img_size):
+    """Optimized augmentation - cân bằng accuracy và tốc độ"""
     return A.Compose([
         A.Resize(img_size, img_size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=45, p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.4),
+        # Bỏ các transform nặng: OpticalDistortion, GridDistortion, MotionBlur, ElasticTransform
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0)),
-            A.GaussianBlur(blur_limit=(3, 7)),
-            A.MotionBlur(blur_limit=7),
-        ], p=0.3),
+            A.GaussNoise(var_limit=(10.0, 30.0)),
+            A.GaussianBlur(blur_limit=(3, 5)),
+        ], p=0.2),
         A.OneOf([
-            A.OpticalDistortion(distort_limit=0.3),
-            A.GridDistortion(distort_limit=0.3),
-            A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50),
-        ], p=0.3),
-        A.OneOf([
-            A.CLAHE(clip_limit=4.0),
-            A.Sharpen(),
-            A.Emboss(),
-        ], p=0.3),
-        A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        ], p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15),
+            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15),
+        ], p=0.4),
         A.CoarseDropout(
-            max_holes=8, max_height=img_size//16, max_width=img_size//16,
-            min_holes=1, min_height=img_size//32, min_width=img_size//32,
-            fill_value=0, p=0.3
+            max_holes=6, max_height=img_size//20, max_width=img_size//20,
+            min_holes=1, min_height=img_size//40, min_width=img_size//40,
+            fill_value=0, p=0.2
         ),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
@@ -617,7 +607,7 @@ class Trainer:
             
             self.optimizer.zero_grad()
             
-            if self.use_amp:
+            if self.use_amp and self.scaler is not None:
                 with autocast():
                     outputs = self.model(images)
                     loss = self.criterion(outputs, labels)
@@ -634,8 +624,7 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             
-            if self.scheduler is not None:
-                self.scheduler.step()
+            # Không step scheduler ở đây - sẽ step theo epoch
             
             total_loss += loss.item()
             preds = outputs.argmax(dim=1).cpu().numpy()
@@ -694,6 +683,10 @@ def predict_with_tta(model, test_images, device, img_size, batch_size=32, num_wo
     model.eval()
     tta_transforms = get_tta_transforms(img_size)
     use_amp = Config.USE_AMP and torch.cuda.is_available()
+    use_pin_memory = torch.cuda.is_available()
+    
+    # TTA dùng batch size lớn hơn vì không cần gradient
+    tta_batch_size = batch_size * 3
     
     all_preds = []
     
@@ -701,8 +694,8 @@ def predict_with_tta(model, test_images, device, img_size, batch_size=32, num_wo
         print(f"   TTA {tta_idx + 1}/{len(tta_transforms)}")
         
         dataset = BloodCellDataset(test_images, labels=None, transform=transform, is_test=True)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, 
-                               num_workers=num_workers, pin_memory=True)
+        dataloader = DataLoader(dataset, batch_size=tta_batch_size, shuffle=False, 
+                               num_workers=num_workers, pin_memory=use_pin_memory)
         
         preds = []
         for images in tqdm(dataloader, leave=False):
@@ -744,13 +737,16 @@ def train_fold(fold, train_idx, val_idx, train_images, train_labels,
     # Weighted Sampler - XỬ LÝ CLASS IMBALANCE TẠI ĐÂY
     sampler = get_weighted_sampler(y_train)
     
+    # pin_memory chỉ khi có CUDA
+    use_pin_memory = torch.cuda.is_available()
+    
     train_loader = DataLoader(
         train_dataset, batch_size=Config.BATCH_SIZE, sampler=sampler,
-        num_workers=Config.NUM_WORKERS, pin_memory=True, drop_last=True
+        num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory, drop_last=True
     )
     val_loader = DataLoader(
         val_dataset, batch_size=Config.BATCH_SIZE * 2, shuffle=False,
-        num_workers=Config.NUM_WORKERS, pin_memory=True
+        num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory
     )
     
     # Model
@@ -767,10 +763,12 @@ def train_fold(fold, train_idx, val_idx, train_images, train_labels,
     # Loss - KHÔNG dùng class weights (tránh double weighting với sampler)
     criterion = FocalLoss(alpha=None, gamma=Config.FOCAL_GAMMA, label_smoothing=Config.LABEL_SMOOTHING)
     
-    # Optimizer, Scheduler
+    # Optimizer
     optimizer = AdamW(model.parameters(), lr=model_cfg['lr'], weight_decay=1e-4)
-    num_training_steps = len(train_loader) * Config.EPOCHS
-    scheduler = OneCycleLR(optimizer, max_lr=model_cfg['lr'], total_steps=num_training_steps, pct_start=0.1)
+    
+    # Scheduler - step theo EPOCH (không phải batch)
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-7)
     
     trainer = Trainer(model, optimizer, scheduler, criterion, Config.DEVICE, Config.USE_AMP, wandb_run)
     
@@ -784,8 +782,12 @@ def train_fold(fold, train_idx, val_idx, train_images, train_labels,
         train_loss, train_f1 = trainer.train_epoch(train_loader, epoch + 1)
         val_loss, val_f1, _, _, val_probs = trainer.validate(val_loader)
         
+        # Step scheduler sau mỗi epoch
+        scheduler.step()
+        
         print(f"   Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
         print(f"   Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
+        print(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
         
         # Log to wandb
         if wandb_run:
