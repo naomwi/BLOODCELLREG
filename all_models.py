@@ -1,19 +1,20 @@
 """
-Blood Cell Classification - Vast.ai Version
-============================================
-Features:
-- Auto GPU detection & batch size adjustment
-- Wandb logging (optional)
-- Checkpoint save/resume
-- Multi-GPU support (DataParallel)
-- Progress monitoring
-- Auto-upload results to cloud
+Blood Cell Classification - Inspired by Rabia Asghar et al. (2023)
+===================================================================
+Paper: "Classification of Blood Cells Using Deep Learning Models"
+Link: https://www.researchgate.net/publication/373117082
 
-Author: Claude AI
+Key Ideas Applied:
+1. Ensemble multiple pre-trained models (EVA02, ConvNeXt, Swin)
+2. Sparse Categorical Cross-Entropy (thay Focal Loss)
+3. Longer training (more epochs)
+4. Majority Voting for final prediction
+5. Full fine-tuning (không freeze layers)
+
+Dataset: 9-class blood cell classification (imbalanced)
 """
 
 import os
-import sys
 import random
 import numpy as np
 import pandas as pd
@@ -21,358 +22,92 @@ from PIL import Image
 from tqdm import tqdm
 from collections import Counter
 from datetime import datetime
-import json
-import argparse
-import subprocess
-from pathlib import Path
-
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.metrics import f1_score, classification_report, confusion_matrix
-import warnings
-warnings.filterwarnings('ignore')
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
+import warnings
+warnings.filterwarnings('ignore')
 
 import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# ==================== VAST.AI AUTO CONFIG ====================
-def get_gpu_info():
-    """Get GPU information"""
-    if not torch.cuda.is_available():
-        return {'name': 'CPU', 'memory': 0, 'count': 0}
-    
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
-    gpu_count = torch.cuda.device_count()
-    
-    return {
-        'name': gpu_name,
-        'memory': gpu_memory,
-        'count': gpu_count
-    }
-
-def auto_config_batch_size(gpu_memory, model_name, img_size):
-    """Auto configure batch size based on GPU memory"""
-    # Base batch sizes cho 24GB GPU (RTX 3090)
-    base_batch_sizes = {
-        'efficientnet_b4': 32,
-        'efficientnet_b5': 20,
-        'tf_efficientnetv2_s': 32,
-        'tf_efficientnetv2_m': 16,
-        'convnext_small': 24,
-        'convnext_base': 16,
-        'swin_base_patch4_window12_384': 16,
-        'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k': 12,
-    }
-    
-    base_bs = base_batch_sizes.get(model_name, 16)
-    
-    # Scale based on GPU memory (relative to 24GB)
-    memory_scale = gpu_memory / 24.0
-    
-    # Scale based on image size (relative to 384)
-    size_scale = (384 / img_size) ** 2
-    
-    batch_size = int(base_bs * memory_scale * size_scale)
-    batch_size = max(4, min(batch_size, 64))  # Clamp between 4 and 64
-    
-    # Round to nearest multiple of 4
-    batch_size = (batch_size // 4) * 4
-    batch_size = max(4, batch_size)  # Ensure minimum 4
-    
-    return batch_size
-
-# ==================== MODEL CONFIGS ====================
-# Chỉ giữ các model mạnh nhất cho max accuracy
-MODEL_CONFIGS = {
-    # === EFFICIENTNET FAMILY ===
-    'efficientnet_b4': {
-        'name': 'efficientnet_b4',
-        'img_size': 380,
-        'lr': 1e-4,
-        'drop_rate': 0.4,
-        'drop_path': 0.2,
-        'desc': 'EfficientNet-B4 - Balanced choice'
-    },
-    'efficientnet_b5': {
-        'name': 'efficientnet_b5',
-        'img_size': 456,
-        'lr': 8e-5,
-        'drop_rate': 0.4,
-        'drop_path': 0.2,
-        'desc': 'EfficientNet-B5 - Larger, more accurate'
-    },
-    'efficientnetv2_s': {
-        'name': 'tf_efficientnetv2_s',
-        'img_size': 384,
-        'lr': 1e-4,
-        'drop_rate': 0.3,
-        'drop_path': 0.2,
-        'desc': 'EfficientNetV2-S - Fast & accurate'
-    },
-    'efficientnetv2_m': {
-        'name': 'tf_efficientnetv2_m',
-        'img_size': 480,
-        'lr': 5e-5,
-        'drop_rate': 0.4,
-        'drop_path': 0.3,
-        'desc': 'EfficientNetV2-M - High accuracy'
-    },
-    
-    # === CONVNEXT FAMILY ===
-    'convnext_small': {
-        'name': 'convnext_small',
-        'img_size': 384,
-        'lr': 5e-5,
-        'drop_rate': 0.4,
-        'drop_path': 0.2,
-        'desc': 'ConvNeXt-Small - Modern CNN'
-    },
-    'convnext_base': {
-        'name': 'convnext_base',
-        'img_size': 384,
-        'lr': 5e-5,
-        'drop_rate': 0.5,
-        'drop_path': 0.2,
-        'desc': 'ConvNeXt-Base - Strong accuracy'
-    },
-    
-    # === SWIN TRANSFORMER ===
-    'swin_base': {
-        'name': 'swin_base_patch4_window12_384',
-        'img_size': 384,
-        'lr': 3e-5,
-        'drop_rate': 0.4,
-        'drop_path': 0.3,
-        'desc': 'Swin-Base - Transformer, very strong'
-    },
-    
-    # === EVA (State-of-the-art) ===
-    'eva02_base': {
-        'name': 'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k',
-        'img_size': 448,
-        'lr': 2e-5,
-        'drop_rate': 0.4,
-        'drop_path': 0.2,
-        'desc': 'EVA02-Base - SOTA, highest accuracy'
-    },
-}
-
-# ==================== MAIN CONFIG ====================
+# ==================== CONFIG ====================
 class Config:
-    # ===== PATHS (Vast.ai default) =====
+    # Paths
     TRAIN_DIR = "/workspace/data/train"
-    TEST_DIR = "/workspace/data/test"
+    TEST_DIR = "/workspace/data/test1"
     OUTPUT_DIR = "/workspace/outputs"
     CHECKPOINT_DIR = "/workspace/checkpoints"
     
-    # ===== MODEL =====
-    # Options: efficientnet_b4, efficientnet_b5, efficientnetv2_s, efficientnetv2_m,
-    #          convnext_small, convnext_base, swin_base, eva02_base
-    MODEL_CHOICE = 'convnext_base'  # Default: strong accuracy
-    
-    # ===== CLASSES =====
-    CLASSES = ['BA', 'BNE', 'EO', 'LY', 'MMY', 'MO', 'MY', 'PMY', 'SNE']
+    # Classes - SORTED alphabetically (quan trọng!)
+    CLASSES = sorted(['BA', 'BNE', 'EO', 'LY', 'MMY', 'MO', 'MY', 'PMY', 'SNE'])
     NUM_CLASSES = 9
     
-    # ===== CLASS WEIGHTS =====
-    CLASS_WEIGHTS = {
-        'BA': 1.2, 'BNE': 1.0, 'EO': 0.7, 'LY': 1.2, 
-        'MMY': 1.4, 'MO': 1.0, 'MY': 1.3, 'PMY': 1.8, 'SNE': 1.0
-    }
+    # Ensemble Models - inspired by paper comparing multiple architectures
+    ENSEMBLE_MODELS = [
+        {
+            'name': 'eva02_base',
+            'timm_name': 'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k',
+            'img_size': 448,
+            'batch_size': 12,
+        },
+        {
+            'name': 'convnext_base',
+            'timm_name': 'convnext_base.fb_in22k_ft_in1k_384',
+            'img_size': 384,
+            'batch_size': 16,
+        },
+        {
+            'name': 'swin_base',
+            'timm_name': 'swin_base_patch4_window12_384.ms_in22k_ft_in1k',
+            'img_size': 384,
+            'batch_size': 16,
+        },
+    ]
     
-    # ===== TRAINING =====
-    SEED = 42
+    # Training - inspired by paper (150 epochs, Adam)
+    EPOCHS = 50  # Tăng từ 20 lên 50
+    LEARNING_RATE = 2e-5
+    MIN_LR = 1e-7
+    WEIGHT_DECAY = 0.01
+    
+    # Cross-validation
     N_FOLDS = 5
-    EPOCHS = 25
+    
+    # Other
+    SEED = 42
     NUM_WORKERS = 4
-    
-    # ===== LOSS =====
-    LABEL_SMOOTHING = 0.1
-    FOCAL_GAMMA = 2.0
-    
-    # ===== MIXED PRECISION =====
     USE_AMP = True
     
-    # ===== WANDB =====
-    USE_WANDB = False
-    WANDB_PROJECT = "blood-cell-classification"
-    WANDB_RUN_NAME = None
-    
-    # ===== DEVICE =====
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # ===== AUTO CONFIG =====
-    AUTO_BATCH_SIZE = True
-    BATCH_SIZE = None  # Will be auto-configured
-    
-    @classmethod
-    def setup(cls, args=None):
-        """Setup config with auto-detection"""
-        # Get GPU info
-        gpu_info = get_gpu_info()
-        print(f"\n🎮 GPU: {gpu_info['name']}")
-        print(f"   Memory: {gpu_info['memory']:.1f} GB")
-        print(f"   Count: {gpu_info['count']}")
-        
-        # Get model config
-        model_cfg = MODEL_CONFIGS[cls.MODEL_CHOICE]
-        
-        # Auto batch size
-        if cls.AUTO_BATCH_SIZE:
-            cls.BATCH_SIZE = auto_config_batch_size(
-                gpu_info['memory'], 
-                model_cfg['name'],
-                model_cfg['img_size']
-            )
-            # Scale for multi-GPU
-            if gpu_info['count'] > 1:
-                cls.BATCH_SIZE *= gpu_info['count']
-        
-        # Override with args if provided
-        if args:
-            if args.train_dir:
-                cls.TRAIN_DIR = args.train_dir
-            if args.test_dir:
-                cls.TEST_DIR = args.test_dir
-            if args.output_dir:
-                cls.OUTPUT_DIR = args.output_dir
-            if args.model:
-                cls.MODEL_CHOICE = args.model
-            if args.batch_size:
-                cls.BATCH_SIZE = args.batch_size
-            if args.epochs:
-                cls.EPOCHS = args.epochs
-            if args.wandb:
-                cls.USE_WANDB = True
-            if args.wandb_project:
-                cls.WANDB_PROJECT = args.wandb_project
-        
-        # Create directories
-        os.makedirs(cls.OUTPUT_DIR, exist_ok=True)
-        os.makedirs(cls.CHECKPOINT_DIR, exist_ok=True)
-        
-        return model_cfg
-    
-    @classmethod
-    def print_config(cls):
-        """Print configuration"""
-        model_cfg = MODEL_CONFIGS[cls.MODEL_CHOICE]
-        print("\n" + "="*60)
-        print("📋 CONFIGURATION")
-        print("="*60)
-        print(f"Model: {cls.MODEL_CHOICE}")
-        print(f"Description: {model_cfg.get('desc', 'N/A')}")
-        print(f"Image Size: {model_cfg['img_size']}")
-        print(f"Batch Size: {cls.BATCH_SIZE}")
-        print(f"Learning Rate: {model_cfg['lr']}")
-        print(f"Epochs: {cls.EPOCHS}")
-        print(f"Folds: {cls.N_FOLDS}")
-        print(f"Device: {cls.DEVICE}")
-        print(f"Wandb: {'Enabled' if cls.USE_WANDB else 'Disabled'}")
-        print("="*60)
-        print("\n📊 Available Models (sorted by accuracy):")
-        print("-"*60)
-        print(f"{'Model':<20} {'Params':<10} {'Img Size':<10} {'Tier'}")
-        print("-"*60)
-        model_info = [
-            ('eva02_base', '87M', '448', '⭐⭐⭐⭐⭐ SOTA'),
-            ('swin_base', '88M', '384', '⭐⭐⭐⭐⭐ Transformer'),
-            ('convnext_base', '89M', '384', '⭐⭐⭐⭐⭐ Strong'),
-            ('efficientnetv2_m', '54M', '480', '⭐⭐⭐⭐ High'),
-            ('convnext_small', '50M', '384', '⭐⭐⭐⭐ Good'),
-            ('efficientnet_b5', '30M', '456', '⭐⭐⭐⭐ Good'),
-            ('efficientnetv2_s', '21M', '384', '⭐⭐⭐ Balanced'),
-            ('efficientnet_b4', '19M', '380', '⭐⭐⭐ Balanced'),
-        ]
-        for name, params, img, tier in model_info:
-            marker = " ← SELECTED" if name == cls.MODEL_CHOICE else ""
-            print(f"{name:<20} {params:<10} {img:<10} {tier}{marker}")
-        print("-"*60 + "\n")
+    # TTA
+    TTA_TRANSFORMS = 4
 
-# ==================== WANDB SETUP ====================
-def setup_wandb(config):
-    """Setup Weights & Biases logging"""
-    if not config.USE_WANDB:
-        return None
-    
-    try:
-        import wandb
-        
-        run_name = config.WANDB_RUN_NAME or f"{config.MODEL_CHOICE}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        wandb.init(
-            project=config.WANDB_PROJECT,
-            name=run_name,
-            config={
-                'model': config.MODEL_CHOICE,
-                'batch_size': config.BATCH_SIZE,
-                'epochs': config.EPOCHS,
-                'img_size': MODEL_CONFIGS[config.MODEL_CHOICE]['img_size'],
-                'lr': MODEL_CONFIGS[config.MODEL_CHOICE]['lr'],
-                'n_folds': config.N_FOLDS,
-            }
-        )
-        print("✅ Wandb initialized")
-        return wandb
-    except Exception as e:
-        print(f"⚠️ Wandb setup failed: {e}")
-        return None
-
-def log_wandb(wandb, metrics, step=None):
-    """Log metrics to wandb"""
-    if wandb is not None:
-        wandb.log(metrics, step=step)
-
-# ==================== UTILITIES ====================
 def seed_everything(seed):
-    """Set seed for reproducibility"""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def save_checkpoint(model, optimizer, scheduler, epoch, best_f1, path):
-    """Save training checkpoint"""
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'best_f1': best_f1,
-    }, path)
-
-def load_checkpoint(model, optimizer, scheduler, path):
-    """Load training checkpoint"""
-    if not os.path.exists(path):
-        return 0, 0
-    
-    checkpoint = torch.load(path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler and checkpoint['scheduler_state_dict']:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    return checkpoint['epoch'], checkpoint['best_f1']
+    # Ưu tiên speed cho training (benchmark=True)
+    # Nếu cần reproducibility hoàn toàn: đổi benchmark=False, deterministic=True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 # ==================== DATASET ====================
 class BloodCellDataset(Dataset):
-    def __init__(self, image_paths, labels=None, transform=None, is_test=False):
+    def __init__(self, image_paths, labels=None, transform=None):
         self.image_paths = image_paths
         self.labels = labels
         self.transform = transform
-        self.is_test = is_test
         
     def __len__(self):
         return len(self.image_paths)
@@ -383,615 +118,500 @@ class BloodCellDataset(Dataset):
         image = np.array(image)
         
         if self.transform:
-            augmented = self.transform(image=image)
-            image = augmented['image']
+            image = self.transform(image=image)['image']
         
-        if self.is_test:
-            return image
-        else:
+        if self.labels is not None:
             label = self.labels[idx]
             return image, label
+        return image
 
-# ==================== AUGMENTATIONS ====================
-def get_train_transforms(img_size):
-    """Optimized augmentation - cân bằng accuracy và tốc độ"""
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.4),
-        # Bỏ các transform nặng: OpticalDistortion, GridDistortion, MotionBlur, ElasticTransform
-        A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 30.0)),
-            A.GaussianBlur(blur_limit=(3, 5)),
-        ], p=0.2),
-        A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15),
-            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15),
-        ], p=0.4),
-        A.CoarseDropout(
-            max_holes=6, max_height=img_size//20, max_width=img_size//20,
-            min_holes=1, min_height=img_size//40, min_width=img_size//40,
-            fill_value=0, p=0.2
-        ),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2()
-    ])
-
-def get_valid_transforms(img_size):
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2()
-    ])
+# ==================== TRANSFORMS ====================
+def get_transforms(img_size, is_train=True):
+    if is_train:
+        return A.Compose([
+            A.Resize(img_size, img_size),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+            A.OneOf([
+                A.GaussNoise(var_limit=(10, 50)),
+                A.GaussianBlur(blur_limit=(3, 5)),
+            ], p=0.3),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),
+            A.CoarseDropout(max_holes=8, max_height=img_size//16, max_width=img_size//16, p=0.3),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+    else:
+        return A.Compose([
+            A.Resize(img_size, img_size),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
 
 def get_tta_transforms(img_size):
+    """TTA transforms - deterministic rotations"""
     return [
+        # Original
         A.Compose([
             A.Resize(img_size, img_size),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ]),
+        # HFlip
         A.Compose([
             A.Resize(img_size, img_size),
             A.HorizontalFlip(p=1.0),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ]),
+        # VFlip
         A.Compose([
             A.Resize(img_size, img_size),
             A.VerticalFlip(p=1.0),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ]),
+        # Rotate 90 degrees (deterministic)
         A.Compose([
             A.Resize(img_size, img_size),
-            A.RandomRotate90(p=1.0),
+            A.Rotate(limit=(90, 90), p=1.0, border_mode=0),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ]),
     ]
 
-# ==================== LOSS ====================
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        self.label_smoothing = label_smoothing
-        
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(
-            inputs, targets, 
-            weight=self.alpha, 
-            reduction='none',
-            label_smoothing=self.label_smoothing
-        )
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        return focal_loss
-
 # ==================== MODEL ====================
 class BloodCellModel(nn.Module):
-    def __init__(self, model_name, num_classes, pretrained=True, drop_rate=0.3, drop_path=0.1):
+    """
+    Simple model inspired by paper:
+    - Pre-trained backbone as feature extractor
+    - Custom classification head
+    """
+    def __init__(self, model_name, num_classes=9, pretrained=True):
         super().__init__()
         
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=pretrained,
-            num_classes=0,
-            drop_rate=drop_rate,
-            drop_path_rate=drop_path
-        )
-        
-        # Lấy feature dimension từ model (không cần dummy input)
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
         in_features = self.backbone.num_features
         
+        # Classification head - inspired by paper's simple approach
         self.head = nn.Sequential(
-            nn.BatchNorm1d(in_features),
-            nn.Dropout(drop_rate),
+            nn.LayerNorm(in_features),
+            nn.Dropout(0.3),
             nn.Linear(in_features, 512),
             nn.GELU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(drop_rate),
+            nn.Dropout(0.2),
             nn.Linear(512, num_classes)
         )
         
     def forward(self, x):
         features = self.backbone(x)
-        output = self.head(features)
-        return output
+        return self.head(features)
 
-# ==================== DATA PREPARATION ====================
-def prepare_data(train_dir, test_dir):
-    train_images = []
-    train_labels = []
+# ==================== TRAINING FUNCTIONS ====================
+def train_one_epoch(model, dataloader, criterion, optimizer, device, use_amp, scaler):
+    model.train()
+    running_loss = 0.0
     
-    for class_name in Config.CLASSES:
-        class_dir = os.path.join(train_dir, class_name)
-        if os.path.exists(class_dir):
-            for img_name in os.listdir(class_dir):
-                if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    train_images.append(os.path.join(class_dir, img_name))
-                    train_labels.append(Config.CLASSES.index(class_name))
+    pbar = tqdm(dataloader, desc='Training')
+    for images, labels in pbar:
+        images = images.to(device)
+        labels = labels.to(device)
+        
+        optimizer.zero_grad(set_to_none=True)  # Faster + less VRAM
+        
+        if use_amp and scaler is not None:
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        
+        running_loss += loss.item()
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
-    test_images = []
-    test_ids = []
-    if os.path.exists(test_dir):
-        for img_name in sorted(os.listdir(test_dir)):
-            if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                test_images.append(os.path.join(test_dir, img_name))
-                test_ids.append(img_name)
-    
-    print(f"📊 Training images: {len(train_images)}")
-    print(f"📊 Test images: {len(test_images)}")
-    
-    label_counts = Counter(train_labels)
-    print("\n📈 Class distribution:")
-    for i, class_name in enumerate(Config.CLASSES):
-        count = label_counts.get(i, 0)
-        pct = 100*count/len(train_labels) if train_labels else 0
-        print(f"   {class_name}: {count} ({pct:.1f}%)")
-    
-    return train_images, train_labels, test_images, test_ids
+    return running_loss / len(dataloader)
 
-def get_weighted_sampler(labels):
-    class_counts = Counter(labels)
-    num_samples = len(labels)
-    
-    class_weights = []
-    for i in range(Config.NUM_CLASSES):
-        count = class_counts.get(i, 1)
-        weight = num_samples / (Config.NUM_CLASSES * count)
-        class_name = Config.CLASSES[i]
-        weight *= Config.CLASS_WEIGHTS.get(class_name, 1.0)
-        class_weights.append(weight)
-    
-    sample_weights = [class_weights[label] for label in labels]
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-    
-    return sampler
-
-def get_class_weights(labels):
-    """
-    Calculate class weights for loss function.
-    
-    NOTE: Hiện tại KHÔNG SỬ DỤNG vì đã dùng Weighted Sampler.
-    Giữ lại để tham khảo nếu cần chuyển sang dùng weighted loss.
-    """
-    class_counts = Counter(labels)
-    total = len(labels)
-    
-    weights = []
-    for i in range(Config.NUM_CLASSES):
-        count = class_counts.get(i, 1)
-        weight = total / (Config.NUM_CLASSES * count)
-        class_name = Config.CLASSES[i]
-        weight *= Config.CLASS_WEIGHTS.get(class_name, 1.0)
-        weights.append(weight)
-    
-    return torch.FloatTensor(weights)
-
-# ==================== TRAINER ====================
-class Trainer:
-    def __init__(self, model, optimizer, scheduler, criterion, device, use_amp=True, wandb_run=None):
-        self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.criterion = criterion
-        self.device = device
-        # Chỉ dùng AMP khi có CUDA
-        self.use_amp = use_amp and torch.cuda.is_available()
-        self.scaler = GradScaler() if self.use_amp else None
-        self.wandb = wandb_run
-        
-    def train_epoch(self, dataloader, epoch):
-        self.model.train()
-        total_loss = 0
-        all_preds = []
-        all_labels = []
-        
-        pbar = tqdm(dataloader, desc=f'Train Epoch {epoch}')
-        for batch_idx, (images, labels) in enumerate(pbar):
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            
-            self.optimizer.zero_grad()
-            
-            if self.use_amp and self.scaler is not None:
-                with autocast():
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, labels)
-                
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-            
-            # Không step scheduler ở đây - sẽ step theo epoch
-            
-            total_loss += loss.item()
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
-            
-            # Update progress bar
-            current_f1 = f1_score(all_labels, all_preds, average='macro')
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'f1': f'{current_f1:.4f}',
-                'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
-            })
-        
-        avg_loss = total_loss / len(dataloader)
-        f1 = f1_score(all_labels, all_preds, average='macro')
-        
-        return avg_loss, f1
-    
-    @torch.no_grad()
-    def validate(self, dataloader):
-        self.model.eval()
-        total_loss = 0
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        
-        for images, labels in tqdm(dataloader, desc='Validating'):
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            
-            if self.use_amp:
-                with autocast():
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, labels)
-            else:
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
-            
-            total_loss += loss.item()
-            probs = F.softmax(outputs, dim=1)
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.append(probs.cpu().numpy())
-        
-        avg_loss = total_loss / len(dataloader)
-        f1 = f1_score(all_labels, all_preds, average='macro')
-        all_probs = np.concatenate(all_probs, axis=0)
-        
-        return avg_loss, f1, all_preds, all_labels, all_probs
-
-# ==================== INFERENCE ====================
-@torch.no_grad()
-def predict_with_tta(model, test_images, device, img_size, batch_size=32, num_workers=4):
+def validate(model, dataloader, criterion, device, use_amp):
     model.eval()
-    tta_transforms = get_tta_transforms(img_size)
-    use_amp = Config.USE_AMP and torch.cuda.is_available()
-    use_pin_memory = torch.cuda.is_available()
-    
-    # TTA dùng batch size lớn hơn vì không cần gradient
-    tta_batch_size = batch_size * 3
-    
+    running_loss = 0.0
     all_preds = []
+    all_labels = []
     
-    for tta_idx, transform in enumerate(tta_transforms):
-        print(f"   TTA {tta_idx + 1}/{len(tta_transforms)}")
-        
-        dataset = BloodCellDataset(test_images, labels=None, transform=transform, is_test=True)
-        dataloader = DataLoader(dataset, batch_size=tta_batch_size, shuffle=False, 
-                               num_workers=num_workers, pin_memory=use_pin_memory)
-        
-        preds = []
-        for images in tqdm(dataloader, leave=False):
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc='Validating'):
             images = images.to(device)
+            labels = labels.to(device)
+            
             if use_amp:
                 with autocast():
                     outputs = model(images)
+                    loss = criterion(outputs, labels)
             else:
                 outputs = model(images)
-            probs = F.softmax(outputs, dim=1)
-            preds.append(probs.cpu().numpy())
-        
-        preds = np.concatenate(preds, axis=0)
-        all_preds.append(preds)
+                loss = criterion(outputs, labels)
+            
+            running_loss += loss.item()
+            preds = outputs.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
     
-    avg_preds = np.mean(all_preds, axis=0)
-    final_preds = np.argmax(avg_preds, axis=1)
-    
-    return final_preds, avg_preds
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    return running_loss / len(dataloader), f1, all_preds, all_labels
 
-# ==================== TRAINING FUNCTIONS ====================
-def train_fold(fold, train_idx, val_idx, train_images, train_labels, 
-               test_images, model_cfg, wandb_run=None):
-    """Train a single fold"""
+def predict_tta(model, image_paths, img_size, device, use_amp, batch_size=32):
+    """TTA prediction"""
+    model.eval()
+    tta_transforms = get_tta_transforms(img_size)
     
-    print(f"\n{'='*50}")
-    print(f"📁 FOLD {fold + 1}/{Config.N_FOLDS}")
-    print(f"{'='*50}")
+    all_probs = []
     
-    X_train = [train_images[i] for i in train_idx]
-    X_val = [train_images[i] for i in val_idx]
-    y_train = [train_labels[i] for i in train_idx]
-    y_val = [train_labels[i] for i in val_idx]
+    for transform in tta_transforms:
+        dataset = BloodCellDataset(image_paths, transform=transform)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, 
+                               num_workers=Config.NUM_WORKERS, pin_memory=torch.cuda.is_available())
+        
+        probs = []
+        with torch.no_grad():
+            for images in tqdm(dataloader, desc='Predicting', leave=False):
+                images = images.to(device)
+                
+                if use_amp:
+                    with autocast():
+                        outputs = model(images)
+                else:
+                    outputs = model(images)
+                
+                probs.append(F.softmax(outputs, dim=1).cpu().numpy())
+        
+        all_probs.append(np.concatenate(probs, axis=0))
     
-    # Datasets
-    train_dataset = BloodCellDataset(X_train, y_train, transform=get_train_transforms(model_cfg['img_size']))
-    val_dataset = BloodCellDataset(X_val, y_val, transform=get_valid_transforms(model_cfg['img_size']))
+    # Average TTA predictions
+    return np.mean(all_probs, axis=0)
+
+# ==================== DATA PREPARATION ====================
+def prepare_data():
+    """Load data with SORTED class order (critical!)"""
+    train_images, train_labels = [], []
     
-    # Weighted Sampler - XỬ LÝ CLASS IMBALANCE TẠI ĐÂY
-    sampler = get_weighted_sampler(y_train)
+    print(f"Classes order: {Config.CLASSES}")
     
-    # pin_memory chỉ khi có CUDA
+    for class_idx, class_name in enumerate(Config.CLASSES):
+        class_dir = os.path.join(Config.TRAIN_DIR, class_name)
+        if os.path.exists(class_dir):
+            images = sorted([f for f in os.listdir(class_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            for img_name in images:
+                train_images.append(os.path.join(class_dir, img_name))
+                train_labels.append(class_idx)
+            print(f"  {class_name} (idx={class_idx}): {len(images)} images")
+    
+    print(f"\nTotal training images: {len(train_images)}")
+    return np.array(train_images), np.array(train_labels)
+
+def prepare_test_data():
+    """Load test data"""
+    test_images = sorted([
+        os.path.join(Config.TEST_DIR, f) 
+        for f in os.listdir(Config.TEST_DIR) 
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ])
+    print(f"Total test images: {len(test_images)}")
+    return test_images
+
+# ==================== MAIN TRAINING ====================
+def train_single_model(model_config, train_images, train_labels, device):
+    """Train a single model with K-Fold CV"""
+    
+    model_name = model_config['name']
+    timm_name = model_config['timm_name']
+    img_size = model_config['img_size']
+    batch_size = model_config['batch_size']
+    
+    print(f"\n{'='*60}")
+    print(f"Training: {model_name}")
+    print(f"  Timm: {timm_name}")
+    print(f"  Image size: {img_size}")
+    print(f"  Batch size: {batch_size}")
+    print(f"{'='*60}")
+    
+    # Setup
+    use_amp = Config.USE_AMP and torch.cuda.is_available()
     use_pin_memory = torch.cuda.is_available()
     
-    train_loader = DataLoader(
-        train_dataset, batch_size=Config.BATCH_SIZE, sampler=sampler,
-        num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory, drop_last=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=Config.BATCH_SIZE * 2, shuffle=False,
-        num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory
-    )
-    
-    # Model
-    model = BloodCellModel(
-        model_cfg['name'], Config.NUM_CLASSES, pretrained=True,
-        drop_rate=model_cfg['drop_rate'], drop_path=model_cfg['drop_path']
-    ).to(Config.DEVICE)
-    
-    # Multi-GPU
-    if torch.cuda.device_count() > 1:
-        print(f"🔥 Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
-    
-    # Loss - KHÔNG dùng class weights (tránh double weighting với sampler)
-    criterion = FocalLoss(alpha=None, gamma=Config.FOCAL_GAMMA, label_smoothing=Config.LABEL_SMOOTHING)
-    
-    # Optimizer
-    optimizer = AdamW(model.parameters(), lr=model_cfg['lr'], weight_decay=1e-4)
-    
-    # Scheduler - step theo EPOCH (không phải batch)
-    from torch.optim.lr_scheduler import CosineAnnealingLR
-    scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-7)
-    
-    trainer = Trainer(model, optimizer, scheduler, criterion, Config.DEVICE, Config.USE_AMP, wandb_run)
-    
-    # Training loop
-    best_f1 = 0
-    best_model_path = os.path.join(Config.CHECKPOINT_DIR, f'best_model_{Config.MODEL_CHOICE}_fold{fold}.pt')
-    patience = 5
-    patience_counter = 0
-    
-    for epoch in range(Config.EPOCHS):
-        train_loss, train_f1 = trainer.train_epoch(train_loader, epoch + 1)
-        val_loss, val_f1, _, _, val_probs = trainer.validate(val_loader)
-        
-        # Step scheduler sau mỗi epoch
-        scheduler.step()
-        
-        print(f"   Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
-        print(f"   Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
-        print(f"   LR: {scheduler.get_last_lr()[0]:.2e}")
-        
-        # Log to wandb
-        if wandb_run:
-            log_wandb(wandb_run, {
-                f'fold{fold}/train_loss': train_loss,
-                f'fold{fold}/train_f1': train_f1,
-                f'fold{fold}/val_loss': val_loss,
-                f'fold{fold}/val_f1': val_f1,
-                'epoch': epoch + 1
-            })
-        
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            # Save model state
-            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            torch.save(state_dict, best_model_path)
-            print(f"   ✓ Saved best model with F1: {best_f1:.4f}")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"   ⏹ Early stopping at epoch {epoch + 1}")
-                break
-    
-    # Load best model for inference
-    state_dict = torch.load(best_model_path)
-    if hasattr(model, 'module'):
-        model.module.load_state_dict(state_dict)
-    else:
-        model.load_state_dict(state_dict)
-    
-    # OOF predictions
-    _, _, _, _, oof_probs = trainer.validate(val_loader)
-    
-    # Test predictions with TTA
-    print("   🔮 Predicting test set with TTA...")
-    _, test_probs = predict_with_tta(
-        model, test_images, Config.DEVICE,
-        model_cfg['img_size'], Config.BATCH_SIZE, Config.NUM_WORKERS
-    )
-    
-    return oof_probs, test_probs, best_f1, val_idx
-
-def train_kfold(train_images, train_labels, test_images, test_ids, wandb_run=None):
-    """K-Fold Cross Validation Training"""
-    
-    model_cfg = MODEL_CONFIGS[Config.MODEL_CHOICE]
-    
-    train_images = np.array(train_images)
-    train_labels = np.array(train_labels)
-    
-    # NOTE: Class weighting strategy
-    # - Weighted Sampler: Đảm bảo mỗi batch có balanced classes  
-    # - Loss: KHÔNG dùng class weights (tránh double weighting)
-    
+    # K-Fold
     skf = StratifiedKFold(n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED)
     
     oof_preds = np.zeros((len(train_images), Config.NUM_CLASSES))
-    test_preds = np.zeros((len(test_images), Config.NUM_CLASSES))
     fold_scores = []
     
     for fold, (train_idx, val_idx) in enumerate(skf.split(train_images, train_labels)):
-        oof_probs, test_probs, best_f1, val_idx = train_fold(
-            fold, train_idx, val_idx, 
-            train_images.tolist(), train_labels.tolist(),
-            test_images, model_cfg, wandb_run
+        print(f"\n--- Fold {fold + 1}/{Config.N_FOLDS} ---")
+        
+        # Data
+        X_train, X_val = train_images[train_idx], train_images[val_idx]
+        y_train, y_val = train_labels[train_idx], train_labels[val_idx]
+        
+        train_transform = get_transforms(img_size, is_train=True)
+        val_transform = get_transforms(img_size, is_train=False)
+        
+        train_dataset = BloodCellDataset(X_train, y_train, train_transform)
+        val_dataset = BloodCellDataset(X_val, y_val, val_transform)
+        
+        # Weighted Sampler for imbalanced data
+        class_counts = Counter(y_train)
+        weights = [1.0 / class_counts[label] for label in y_train]
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights, len(weights), replacement=True  # replacement=True quan trọng cho imbalanced data
         )
         
-        oof_preds[val_idx] = oof_probs
-        test_preds += test_probs / Config.N_FOLDS
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler,
+                                  num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size * 2, shuffle=False,
+                               num_workers=Config.NUM_WORKERS, pin_memory=use_pin_memory)
+        
+        # Model
+        model = BloodCellModel(timm_name, Config.NUM_CLASSES).to(device)
+        
+        # Loss - Sparse Categorical Cross-Entropy (inspired by paper)
+        # Không dùng class weights trong loss vì đã có weighted sampler
+        criterion = nn.CrossEntropyLoss()
+        
+        # Optimizer - Adam (inspired by paper)
+        optimizer = AdamW(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY)
+        
+        # Scheduler - Cosine Annealing (per epoch)
+        scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=Config.MIN_LR)
+        
+        # GradScaler
+        scaler = GradScaler() if use_amp else None
+        
+        # Training loop
+        best_f1 = 0
+        best_epoch = 0
+        patience = 10
+        patience_counter = 0
+        
+        for epoch in range(Config.EPOCHS):
+            print(f"\nEpoch {epoch + 1}/{Config.EPOCHS}")
+            
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, 
+                                         device, use_amp, scaler)
+            val_loss, val_f1, val_preds, val_labels = validate(model, val_loader, criterion, device, use_amp)
+            
+            # Step scheduler per epoch
+            scheduler.step()
+            
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f} | LR: {current_lr:.2e}")
+            
+            # Save best model
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                best_epoch = epoch + 1
+                patience_counter = 0
+                
+                checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, f"{model_name}_fold{fold}.pt")
+                torch.save(model.state_dict(), checkpoint_path)
+                print(f"  ✓ Saved best model (F1: {best_f1:.4f})")
+            else:
+                patience_counter += 1
+            
+            # Early stopping
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch + 1}")
+                break
+        
+        print(f"\nFold {fold + 1} Best F1: {best_f1:.4f} (Epoch {best_epoch})")
         fold_scores.append(best_f1)
         
-        print(f"\n📊 Fold {fold + 1} Best F1: {best_f1:.4f}")
+        # Load best model and get OOF predictions
+        if os.path.exists(checkpoint_path):
+            model.load_state_dict(torch.load(checkpoint_path))
+        else:
+            print("  ⚠️ No checkpoint found, using last epoch weights")
+        oof_preds[val_idx] = predict_tta(model, X_val, img_size, device, use_amp, batch_size * 3)
+        
+        # Clear memory
+        del model, optimizer, scheduler, scaler
+        torch.cuda.empty_cache()
     
-    # Final results
-    print(f"\n{'='*60}")
-    print("📈 FINAL RESULTS")
-    print(f"{'='*60}")
-    print(f"Fold F1 Scores: {[f'{s:.4f}' for s in fold_scores]}")
-    print(f"Mean F1: {np.mean(fold_scores):.4f} ± {np.std(fold_scores):.4f}")
+    # OOF Score
+    oof_pred_labels = oof_preds.argmax(axis=1)
+    oof_f1 = f1_score(train_labels, oof_pred_labels, average='macro')
     
-    oof_f1 = f1_score(train_labels, np.argmax(oof_preds, axis=1), average='macro')
-    print(f"OOF F1 Score: {oof_f1:.4f}")
+    print(f"\n{model_name} Results:")
+    print(f"  Fold F1 Scores: {[f'{s:.4f}' for s in fold_scores]}")
+    print(f"  Mean F1: {np.mean(fold_scores):.4f} ± {np.std(fold_scores):.4f}")
+    print(f"  OOF F1: {oof_f1:.4f}")
     
-    if wandb_run:
-        log_wandb(wandb_run, {
-            'final/mean_f1': np.mean(fold_scores),
-            'final/std_f1': np.std(fold_scores),
-            'final/oof_f1': oof_f1
-        })
-    
-    return test_preds, test_ids
+    return oof_preds, fold_scores, oof_f1
 
-# ==================== SUBMISSION ====================
-def create_submission(test_preds, test_ids, output_path):
-    pred_labels = np.argmax(test_preds, axis=1)
-    pred_classes = [Config.CLASSES[p] for p in pred_labels]
+def predict_single_model(model_config, test_images, device):
+    """Predict with a single model (ensemble of folds)"""
     
-    submission = pd.DataFrame({
-        'ID': test_ids,
-        'TARGET': pred_classes
-    })
+    model_name = model_config['name']
+    timm_name = model_config['timm_name']
+    img_size = model_config['img_size']
+    batch_size = model_config['batch_size']
     
-    submission.to_csv(output_path, index=False)
+    use_amp = Config.USE_AMP and torch.cuda.is_available()
     
-    print(f"\n📁 Submission saved to: {output_path}")
-    print(f"   Shape: {submission.shape}")
-    print("\n📊 Prediction distribution:")
-    print(submission['TARGET'].value_counts().to_string())
+    all_preds = []
     
-    return submission
+    for fold in range(Config.N_FOLDS):
+        checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, f"{model_name}_fold{fold}.pt")
+        
+        model = BloodCellModel(timm_name, Config.NUM_CLASSES).to(device)
+        model.load_state_dict(torch.load(checkpoint_path))
+        
+        preds = predict_tta(model, test_images, img_size, device, use_amp, batch_size * 3)
+        all_preds.append(preds)
+        
+        del model
+        torch.cuda.empty_cache()
+    
+    # Average predictions from all folds
+    return np.mean(all_preds, axis=0)
 
-# ==================== ARGUMENT PARSER ====================
-def parse_args():
-    parser = argparse.ArgumentParser(description='Blood Cell Classification - Vast.ai (Max Accuracy)')
+def ensemble_predict(all_model_preds, method='average'):
+    """
+    Ensemble predictions from multiple models
     
-    # Paths
-    parser.add_argument('--train_dir', type=str, default=None, help='Training data directory')
-    parser.add_argument('--test_dir', type=str, default=None, help='Test data directory')
-    parser.add_argument('--output_dir', type=str, default=None, help='Output directory')
+    Methods:
+    - 'average': Average probabilities (soft voting)
+    - 'voting': Majority voting (hard voting)
+    """
+    if method == 'average':
+        # Soft voting - average probabilities
+        return np.mean(all_model_preds, axis=0)
     
-    # Model - Chỉ các model mạnh nhất
-    parser.add_argument('--model', type=str, default='convnext_base',
-                       choices=['efficientnet_b4', 'efficientnet_b5', 'efficientnetv2_s', 
-                               'efficientnetv2_m', 'convnext_small', 'convnext_base', 
-                               'swin_base', 'eva02_base'],
-                       help='Model to use (default: convnext_base)')
+    elif method == 'voting':
+        # Hard voting - majority vote on predictions
+        all_labels = [preds.argmax(axis=1) for preds in all_model_preds]
+        final_labels = []
+        
+        for i in range(len(all_labels[0])):
+            votes = [labels[i] for labels in all_labels]
+            most_common = Counter(votes).most_common(1)[0][0]
+            final_labels.append(most_common)
+        
+        return np.array(final_labels)
     
-    # Training
-    parser.add_argument('--batch_size', type=int, default=None, help='Batch size (auto if not set)')
-    parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
-    parser.add_argument('--folds', type=int, default=5, help='Number of folds')
-    parser.add_argument('--mode', type=str, default='kfold', choices=['single', 'kfold'], help='Training mode')
-    
-    # Wandb
-    parser.add_argument('--wandb', action='store_true', help='Enable Wandb logging')
-    parser.add_argument('--wandb_project', type=str, default='blood-cell-classification', help='Wandb project name')
-    
-    # Misc
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    return parser.parse_args()
+    else:
+        raise ValueError(f"Unknown method: {method}")
 
 # ==================== MAIN ====================
 def main():
-    print("""
-    ╔══════════════════════════════════════════════════════════╗
-    ║       🩸 BLOOD CELL CLASSIFICATION - VAST.AI             ║
-    ╚══════════════════════════════════════════════════════════╝
-    """)
+    print("="*60)
+    print("Blood Cell Classification - Ensemble Approach")
+    print("Inspired by Rabia Asghar et al. (2023)")
+    print("="*60)
     
-    # Parse arguments
-    args = parse_args()
-    
-    # Setup config
-    Config.MODEL_CHOICE = args.model
-    Config.N_FOLDS = args.folds
-    Config.SEED = args.seed
-    model_cfg = Config.setup(args)
-    
-    # Print config
-    Config.print_config()
-    
-    # Set seed
+    # Setup
     seed_everything(Config.SEED)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\nDevice: {device}")
     
-    # Setup Wandb
-    wandb_run = setup_wandb(Config) if Config.USE_WANDB else None
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
     
-    # Prepare data
-    print("\n📂 Loading data...")
-    train_images, train_labels, test_images, test_ids = prepare_data(
-        Config.TRAIN_DIR, Config.TEST_DIR
-    )
+    # Load data
+    print("\n" + "="*40)
+    print("Loading Data...")
+    print("="*40)
+    train_images, train_labels = prepare_data()
+    test_images = prepare_test_data()
     
-    if len(train_images) == 0:
-        print("❌ No training data found! Please check TRAIN_DIR path.")
-        return
+    # Train all models
+    all_oof_preds = []
+    all_test_preds = []
+    model_results = []
     
-    # Train
-    if args.mode == 'kfold':
-        print("\n🚀 Starting K-Fold Training...")
-        test_preds, test_ids = train_kfold(
-            train_images, train_labels, test_images, test_ids, wandb_run
+    for model_config in Config.ENSEMBLE_MODELS:
+        # Train
+        oof_preds, fold_scores, oof_f1 = train_single_model(
+            model_config, train_images, train_labels, device
         )
-    else:
-        print("\n🚀 Starting Single Model Training...")
-        # Implement single model training if needed
-        pass
+        all_oof_preds.append(oof_preds)
+        model_results.append({
+            'name': model_config['name'],
+            'fold_scores': fold_scores,
+            'oof_f1': oof_f1
+        })
+        
+        # Predict on test
+        print(f"\nPredicting test set with {model_config['name']}...")
+        test_preds = predict_single_model(model_config, test_images, device)
+        all_test_preds.append(test_preds)
     
-    # Create submission
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    submission_path = os.path.join(Config.OUTPUT_DIR, f'submission_{Config.MODEL_CHOICE}_{timestamp}.csv')
-    submission = create_submission(test_preds, test_ids, submission_path)
+    # Ensemble predictions
+    print("\n" + "="*60)
+    print("ENSEMBLE RESULTS")
+    print("="*60)
     
-    # Also save as submission.csv for easy access
-    submission.to_csv(os.path.join(Config.OUTPUT_DIR, 'submission.csv'), index=False)
+    # Method 1: Average (Soft Voting)
+    ensemble_oof = ensemble_predict(all_oof_preds, method='average')
+    ensemble_oof_labels = ensemble_oof.argmax(axis=1)
+    ensemble_oof_f1 = f1_score(train_labels, ensemble_oof_labels, average='macro')
     
-    # Finish wandb
-    if wandb_run:
-        wandb_run.finish()
+    ensemble_test = ensemble_predict(all_test_preds, method='average')
+    ensemble_test_labels = ensemble_test.argmax(axis=1)
     
-    print("\n✅ TRAINING COMPLETE!")
-    print(f"📁 Results saved to: {Config.OUTPUT_DIR}")
+    print(f"\nEnsemble OOF F1 (Soft Voting): {ensemble_oof_f1:.4f}")
+    
+    # Method 2: Majority Voting (Hard Voting) - Fixed
+    all_oof_labels = [p.argmax(axis=1) for p in all_oof_preds]
+    voting_oof = []
+    for i in range(len(train_labels)):
+        votes = [labels[i] for labels in all_oof_labels]
+        most_common = Counter(votes).most_common(1)[0][0]
+        voting_oof.append(most_common)
+    voting_oof = np.array(voting_oof)
+    voting_oof_f1 = f1_score(train_labels, voting_oof, average='macro')
+    
+    print(f"Ensemble OOF F1 (Hard Voting): {voting_oof_f1:.4f}")
+    
+    # Print individual model results
+    print("\nIndividual Model Results:")
+    for result in model_results:
+        print(f"  {result['name']}: OOF F1 = {result['oof_f1']:.4f}")
+    
+    # Save submission
+    print("\n" + "="*40)
+    print("Creating Submission...")
+    print("="*40)
+    
+    submission = pd.DataFrame({
+        'ID': [os.path.basename(p) for p in test_images],
+        'TARGET': [Config.CLASSES[i] for i in ensemble_test_labels]
+    })
+    
+    submission_path = os.path.join(Config.OUTPUT_DIR, 'submission_ensemble.csv')
+    submission.to_csv(submission_path, index=False)
+    print(f"Saved: {submission_path}")
+    
+    # Check prediction distribution
+    print("\nPrediction Distribution:")
+    pred_counts = Counter(ensemble_test_labels)
+    for idx, count in sorted(pred_counts.items()):
+        print(f"  {Config.CLASSES[idx]}: {count} ({count/len(ensemble_test_labels)*100:.1f}%)")
+    
+    # Save probabilities for potential ensemble with other models
+    np.save(os.path.join(Config.OUTPUT_DIR, 'ensemble_test_probs.npy'), ensemble_test)
+    np.save(os.path.join(Config.OUTPUT_DIR, 'ensemble_oof_probs.npy'), ensemble_oof)
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
+    print(f"Best Ensemble OOF F1: {max(ensemble_oof_f1, voting_oof_f1):.4f}")
 
 if __name__ == "__main__":
     main()
