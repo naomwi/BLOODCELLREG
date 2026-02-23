@@ -74,14 +74,18 @@ class Config:
         },
     ]
     
-    # Training - inspired by paper (150 epochs, Adam)
-    EPOCHS = 50  # Tăng từ 20 lên 50
-    LEARNING_RATE = 2e-5
+    # Training - fine-tuning with CLAHE
+    EPOCHS = 15
+    LEARNING_RATE = 5e-6
     MIN_LR = 1e-7
     WEIGHT_DECAY = 0.01
     
     # Cross-validation
     N_FOLDS = 5
+    
+    # Resume Control
+    RESUME_TRAINING = True
+    RESUME_EPOCH = 0 # Default starting epoch if resuming
     
     # Other
     SEED = 42
@@ -140,6 +144,7 @@ def get_transforms(img_size, is_train=True):
             ], p=0.3),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
             A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.5),
             A.CoarseDropout(max_holes=8, max_height=img_size//16, max_width=img_size//16, p=0.3),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
@@ -380,6 +385,12 @@ def train_single_model(model_config, train_images, train_labels, device):
         # Model
         model = BloodCellModel(timm_name, Config.NUM_CLASSES).to(device)
         
+        # Load checkpoint if resuming
+        checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, f"{model_name}_fold{fold}.pt")
+        if Config.RESUME_TRAINING and os.path.exists(checkpoint_path):
+            print(f"  --> Resuming training from existing checkpoint: {checkpoint_path}")
+            model.load_state_dict(torch.load(checkpoint_path))
+        
         # Loss - Sparse Categorical Cross-Entropy (inspired by paper)
         # Không dùng class weights trong loss vì đã có weighted sampler
         criterion = nn.CrossEntropyLoss()
@@ -395,11 +406,11 @@ def train_single_model(model_config, train_images, train_labels, device):
         
         # Training loop
         best_f1 = 0
-        best_epoch = 0
+        best_epoch = Config.RESUME_EPOCH
         patience = 10
         patience_counter = 0
         
-        for epoch in range(Config.EPOCHS):
+        for epoch in range(Config.RESUME_EPOCH, Config.EPOCHS):
             print(f"\nEpoch {epoch + 1}/{Config.EPOCHS}")
             
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, 
