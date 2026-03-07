@@ -1,0 +1,92 @@
+{
+    "BA": {
+        "Color_Var_B_G_R": [
+            21.53,
+            52.17,
+            45.55
+        ],
+        "Mean_Saturation": 62.09,
+        "Mean_Blur_Var": 75.5,
+        "Mean_Center_Intensity": 162.7
+    },
+    "BNE": {
+        "Color_Var_B_G_R": [
+            19.17,
+            45.76,
+            39.07
+        ],
+        "Mean_Saturation": 59.53,
+        "Mean_Blur_Var": 49.2,
+        "Mean_Center_Intensity": 173.8
+    },
+    "EO": {
+        "Color_Var_B_G_R": [
+            21.0,
+            49.02,
+            39.77
+        ],
+        "Mean_Saturation": 61.52,
+        "Mean_Blur_Var": 46.8,
+        "Mean_Center_Intensity": 167.2
+    },
+    "LY": {
+        "Color_Var_B_G_R": [
+            19.84,
+            47.31,
+            40.75
+        ],
+        "Mean_Saturation": 57.62,
+        "Mean_Blur_Var": 35.6,
+        "Mean_Center_Intensity": 176.8
+    },
+    "MMY": {
+        "Color_Var_B_G_R": [
+            21.21,
+            51.14,
+            44.43
+        ],
+        "Mean_Saturation": 60.86,
+        "Mean_Blur_Var": 56.1,
+        "Mean_Center_Intensity": 167.8
+    },
+    "MO": {
+        "Color_Var_B_G_R": [
+            18.74,
+            49.98,
+            42.43
+        ],
+        "Mean_Saturation": 59.62,
+        "Mean_Blur_Var": 52.6,
+        "Mean_Center_Intensity": 157.7
+    },
+    "MY": {
+        "Color_Var_B_G_R": [
+            21.06,
+            52.09,
+            44.92
+        ],
+        "Mean_Saturation": 62.12,
+        "Mean_Blur_Var": 61.5,
+        "Mean_Center_Intensity": 161.8
+    },
+    "PMY": {
+        "Color_Var_B_G_R": [
+            21.97,
+            57.25,
+            48.74
+        ],
+        "Mean_Saturation": 66.03,
+        "Mean_Blur_Var": 92.5,
+        "Mean_Center_Intensity": 143.0
+    },
+    "SNE": {
+        "Color_Var_B_G_R": [
+            19.2,
+            45.71,
+            39.63
+        ],
+        "Mean_Saturation": 58.2,
+        "Mean_Blur_Var": 49.9,
+        "Mean_Center_Intensity": 172.1
+    }
+}
