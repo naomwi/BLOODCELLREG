@@ -1,18 +1,3 @@
-"""
-Blood Cell Classification - Inspired by Rabia Asghar et al. (2023)
-===================================================================
-Paper: "Classification of Blood Cells Using Deep Learning Models"
-Link: https://www.researchgate.net/publication/373117082
-
-Key Ideas Applied:
-1. Ensemble multiple pre-trained models (EVA02, ConvNeXt, Swin)
-2. Sparse Categorical Cross-Entropy (thay Focal Loss)
-3. Longer training (more epochs)
-4. Majority Voting for final prediction
-5. Full fine-tuning (không freeze layers)
-
-Dataset: 9-class blood cell classification (imbalanced)
-"""
 
 import os
 import random
